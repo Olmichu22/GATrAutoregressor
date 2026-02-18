@@ -1,0 +1,150 @@
+# =========================================================
+# Configuración de GATrAutoRegressor para Particle Flow
+# =========================================================
+#
+# Este archivo contiene la configuración por defecto para el
+# entrenamiento del modelo GATrAutoRegressor.
+#
+# Uso:
+#   python train_gatr_autoregressor.py --config configs/gatr_autoregressor_default.yaml
+#
+# Los parámetros de línea de comandos tienen prioridad sobre
+# los valores de este archivo.
+# =========================================================
+
+# -------------------------
+# Seed para reproducibilidad
+# -------------------------
+seed: 42
+
+# -------------------------
+# Directorios
+# -------------------------
+checkpoint_dir: "checkpoints/gatr_autoregressor"
+resume_from: null  # Ruta a un checkpoint para continuar entrenamiento
+
+# -------------------------
+# Configuración de datos
+# -------------------------
+data:
+  # Lista de archivos .npz generados por convert_to_nn_format.py
+  # dataset_paths:
+  #   - "data/out_reco_edm4hep_edm4hep_1.npz"
+  #   - "data/out_reco_edm4hep_edm4hep_2.npz"
+  #   - "data/out_reco_edm4hep_edm4hep_3.npz"
+  #   - "data/out_reco_edm4hep_edm4hep_4.npz"
+  #   - "data/out_reco_edm4hep_edm4hep_5.npz"
+  #   - "data/out_reco_edm4hep_edm4hep_6.npz"
+
+    # - "data/train_events_2.npz"
+  
+  batch_size: 8
+  num_workers: 4
+  val_ratio: 0.1
+  mode: "memory"    # "memory" (más rápido, más RAM) o "lazy" (menos RAM)
+  pin_memory: true
+
+# -------------------------
+# Configuración del preprocesador
+# -------------------------
+preprocessor:
+  # Normalización z-score de coordenadas espaciales
+  normalize_coords: true
+  
+  # Normalización z-score de energía (después de log si aplica)
+  normalize_energy: true
+  normalize_momentum: true
+  
+  # Transformación logarítmica (recomendado para energía/momentum)
+  log_energy: true
+  log_momentum: true
+  log_eps: 1.0e-6
+  
+  # Normalización de momentum de PFOs (generalmente no necesario)
+  normalize_pfo_momentum: true
+  log_pfo_energy: true
+
+# -------------------------
+# Configuración del modelo
+# -------------------------
+model:
+  # Modo del modelo
+  # - "whole_detector": procesa todos los hits juntos
+  # - "detector_split": procesa cada subdetector por separado (4 módulos)
+  mode: "whole_detector"
+  
+  # ---- Encoder GATr (para whole_detector) ----
+  hidden_mv: 32        # Dimensión de multivectores
+  hidden_s: 128         # Dimensión de escalares
+  num_blocks: 5        # Número de bloques GATr
+  in_s_channels: 6     # Canales de entrada escalares (del dataset)
+  in_mv_channels: 1    # Canales de entrada de multivectores
+  out_mv_channels: 1   # Canales de salida de multivectores
+  dropout: 0.1         # Dropout
+  out_s_channels: null # Si null, usa hidden_s
+  
+  # ---- Encoder GATr por detector (para detector_split) ----
+  # Listas de 4 elementos: [INNER_TRACKER, ECAL, HCAL, MUON_TRACKER]
+  split_hidden_mv: [32, 32, 32, 32]
+  split_hidden_s: [64, 64, 64, 64]
+  split_num_blocks: [3, 3, 3, 3]
+  split_in_s_channels: [6, 6, 6, 6]
+  split_dropout: [0.1, 0.1, 0.1, 0.1]
+  
+  # ---- Módulo autoregresivo ----
+  ar_hidden_mv: 32
+  ar_hidden_s: 64
+  ar_num_blocks: 4
+  ar_out_mv_channels: 1
+  ar_out_s_channels: null
+  ar_dropout: 0.1
+
+# -------------------------
+# Configuración de entrenamiento
+# -------------------------
+trainer:
+  # ---- Optimización ----
+  devices: [0, 1, 2]  # Lista de IDs de GPU (e.g., [0, 1]) o "auto"
+  strategy: "ddp"  # "auto", "ddp", "ddp_spawn", etc.
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  
+  # Scheduler: "step" o "cosine"
+  scheduler: "step"
+  decay_steps: 30      # Para scheduler "step"
+  decay_rate: 0.8      # Para scheduler "step"
+  lr_min: 1.0e-6       # Para scheduler "cosine"
+  
+  # ---- Training loop ----
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  precision: "32"  # "32", "16-mixed", "bf16-mixed"
+  accumulate_grad_batches: 1
+  
+  # ---- Pesos de loss ----
+  lambda_dir: 1.0      # Dirección del momentum
+  lambda_mag: 1.0      # Magnitud del momentum
+  lambda_pid: 1.0      # Clasificación de PID
+  lambda_charge: 0.5   # Predicción de carga
+  lambda_assign: 1.0   # Asignación hit→PFO
+  lambda_stop: 0.5     # Predicción de stop
+  
+  # ---- Callbacks ----
+  early_stopping_patience: 20  # 0 para desactivar
+  early_stopping_metric: "val/loss"
+  save_top_k: 3
+  
+  # ---- Logging ----
+  log_every_n_steps: 10
+  plot_every_n_steps: 50
+  num_sanity_val_steps: 2
+
+# -------------------------
+# Configuración de Weights & Biases
+# -------------------------
+wandb:
+  project: "gatr-autoregressor"
+  run_name: "baseline-v1"
+  log_model: false
+  offline: false  # true para desarrollo sin conexión

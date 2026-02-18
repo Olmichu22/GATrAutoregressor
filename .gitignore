@@ -1,0 +1,7 @@
+logs/
+checkpoints/
+wandb/
+data/
+__pycache__/
+*.sh
+*condor*
