@@ -29,7 +29,8 @@ def reorganize_gt_to_tb(
     gt_values: torch.Tensor,
     T: int,
     B: int,
-    device: torch.device
+    device: torch.device,
+    step_offset: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Reorganiza ground truth de formato flat (N_pfo, ...) a (T, B, ...).
@@ -59,8 +60,8 @@ def reorganize_gt_to_tb(
     output_tb = torch.zeros(T, B, *value_shape, device=device, dtype=gt_values.dtype)
     
     # Filtrar PFOs que caben en T steps
-    valid_pfo_mask = pfo_step_idx < T
-    valid_steps = pfo_step_idx[valid_pfo_mask]
+    valid_pfo_mask = (pfo_step_idx >= step_offset) & (pfo_step_idx < step_offset + T)
+    valid_steps = pfo_step_idx[valid_pfo_mask] - step_offset
     valid_events = gt_batch[valid_pfo_mask].long()
     
     output_tb[valid_steps, valid_events] = gt_values[valid_pfo_mask]
@@ -103,6 +104,7 @@ class GATrAutoRegressorLoss(nn.Module):
         output: Dict[str, torch.Tensor],
         pfo_true_objects: Dict[str, torch.Tensor],
         hit_batch: torch.Tensor,
+        step_offset: int = 0,
     ) -> Dict[str, torch.Tensor]:
         """
         Calcula todas las losses.
@@ -142,16 +144,16 @@ class GATrAutoRegressorLoss(nn.Module):
         # 1. Construir máscara de validez (T, B)
         # =============================================
         pfos_per_event = torch.bincount(gt_batch.long(), minlength=B)
-        step_idx = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
+        step_idx = (torch.arange(T, device=device) + step_offset).unsqueeze(1)  # (T, 1)
         valid_mask = step_idx < pfos_per_event.unsqueeze(0)  # (T, B)
         
         # =============================================
         # 2. Reorganizar GT para alinear con predicciones (T, B, ...)
         # =============================================
-        gt_momentum_tb, _ = reorganize_gt_to_tb(gt_batch, gt_momentum, T, B, device)
-        gt_p_mod_tb, _ = reorganize_gt_to_tb(gt_batch, gt_p_mod, T, B, device)
-        gt_pid_tb, _ = reorganize_gt_to_tb(gt_batch, gt_pid, T, B, device)
-        gt_charge_tb, _ = reorganize_gt_to_tb(gt_batch, gt_charge, T, B, device)
+        gt_momentum_tb, _ = reorganize_gt_to_tb(gt_batch, gt_momentum, T, B, device, step_offset=step_offset)
+        gt_p_mod_tb, _ = reorganize_gt_to_tb(gt_batch, gt_p_mod, T, B, device, step_offset=step_offset)
+        gt_pid_tb, _ = reorganize_gt_to_tb(gt_batch, gt_pid, T, B, device, step_offset=step_offset)
+        gt_charge_tb, _ = reorganize_gt_to_tb(gt_batch, gt_charge, T, B, device, step_offset=step_offset)
         
         # =============================================
         # 3. Loss de dirección del momentum
@@ -203,16 +205,17 @@ class GATrAutoRegressorLoss(nn.Module):
         hit_events = hit_batch.long()
         
         for t in range(T):
-            # Un hit pertenece al PFO t si hit_to_pfo == t (índice LOCAL)
-            # Solo válido si el evento tiene al menos t+1 PFOs
-            valid_for_step = t < pfos_per_event[hit_events]
-            gt_assignment[t, :, 0] = ((hit_to_pfo == t) & valid_for_step).float()
+            global_step = t + step_offset
+            # Un hit pertenece al PFO global_step si hit_to_pfo == global_step (índice LOCAL por evento)
+            # Solo válido si el evento tiene al menos global_step+1 PFOs
+            valid_for_step = global_step < pfos_per_event[hit_events]
+            gt_assignment[t, :, 0] = ((hit_to_pfo == global_step) & valid_for_step).float()
         
         pred_assignment = output["assignments_logits"]  # (T, N, 1)
         
         # Crear máscara de validez para assignments
         # Un hit es válido en step t si su evento tiene al menos t+1 PFOs
-        step_idx_assign = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
+        step_idx_assign = (torch.arange(T, device=device) + step_offset).unsqueeze(1)  # (T, 1)
         assignment_valid_mask = step_idx_assign < pfos_per_event[hit_events].unsqueeze(0)  # (T, N)
         
         # Aplicar máscara correctamente
@@ -226,7 +229,7 @@ class GATrAutoRegressorLoss(nn.Module):
         # =============================================
         # 8. Loss de Stop (BCE)
         # =============================================
-        step_idx_stop = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
+        step_idx_stop = (torch.arange(T, device=device) + step_offset).unsqueeze(1)  # (T, 1)
         gt_stop = (step_idx_stop >= pfos_per_event.unsqueeze(0)).float().unsqueeze(-1)  # (T, B, 1)
         
         pred_stop = output["stop_logits"]  # (T, B, 1)
@@ -282,6 +285,10 @@ class GATrAutoRegressorLightningModule(L.LightningModule):
             lambda_stop=getattr(cfg, "lambda_stop", 0.5),
         )
         
+        self.use_ar_chunked_training = bool(getattr(cfg, "ar_chunked_training", False))
+        self.ar_chunk_size = max(1, int(getattr(cfg, "ar_chunk_size", 1)))
+        self.automatic_optimization = not self.use_ar_chunked_training
+
         self.save_hyperparameters(ignore=["model"])
     
     def configure_optimizers(self):
@@ -415,8 +422,7 @@ class GATrAutoRegressorLightningModule(L.LightningModule):
     
     def training_step(self, batch, batch_idx):
         mv_v_part, mv_s_part, scalars, hit_batch, pfo_true_objects = self._prepare_batch(batch)
-        
-        # Forward pass
+
         if getattr(self.cfg, "debug_memory", False):
             rank = int(self.global_rank) if hasattr(self, "global_rank") else 0
             n_hits = int(hit_batch[0].shape[0])
@@ -429,38 +435,104 @@ class GATrAutoRegressorLightningModule(L.LightningModule):
                 f"sum_n_hits={n_hits} max_n_hits_event={max_hits_event} sum_n_pfo={sum_pfo}"
             )
 
-        output = self.model(
-            mv_v_part=mv_v_part,
-            mv_s_part=mv_s_part,
-            scalars=scalars,
-            pfo_true_objects=pfo_true_objects,
-            batch=hit_batch,
-            teacher_forcing=True,
-        )
-        
-        # Handle edge case: no PFOs generated
-        if output["pfo_momentum"] is None:
-            self.log("train/loss", 0.0, prog_bar=True)
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-        
-        # Compute losses
-        losses = self.loss_fn(output, pfo_true_objects, hit_batch[0])
-        
-        # Logging
-        B = int(hit_batch[0].max().item()) + 1
-        self.log("train/loss", losses["loss"], prog_bar=True, batch_size=B, sync_dist=True)
-        self.log("train/loss_dir", losses["loss_dir"], batch_size=B, sync_dist=True)
-        self.log("train/loss_mag", losses["loss_mag"], batch_size=B, sync_dist=True)
-        self.log("train/loss_pid", losses["loss_pid"], batch_size=B, sync_dist=True)
-        self.log("train/loss_charge", losses["loss_charge"], batch_size=B, sync_dist=True)
-        self.log("train/loss_assign", losses["loss_assign"], batch_size=B, sync_dist=True)
-        self.log("train/loss_stop", losses["loss_stop"], batch_size=B, sync_dist=True)
-        
-        # Visualizaciones periódicas
-        if batch_idx % self.plot_every_n_steps == 0 and self.logger is not None:
-            self._log_visualizations(output, pfo_true_objects, hit_batch[0], prefix="train")
-        
-        return losses["loss"]
+        if not self.use_ar_chunked_training:
+            output = self.model(
+                mv_v_part=mv_v_part,
+                mv_s_part=mv_s_part,
+                scalars=scalars,
+                pfo_true_objects=pfo_true_objects,
+                batch=hit_batch,
+                teacher_forcing=True,
+            )
+
+            if output["pfo_momentum"] is None:
+                self.log("train/loss", 0.0, prog_bar=True)
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+            losses = self.loss_fn(output, pfo_true_objects, hit_batch[0])
+            B = int(hit_batch[0].max().item()) + 1
+            self.log("train/loss", losses["loss"], prog_bar=True, batch_size=B, sync_dist=True)
+            self.log("train/loss_dir", losses["loss_dir"], batch_size=B, sync_dist=True)
+            self.log("train/loss_mag", losses["loss_mag"], batch_size=B, sync_dist=True)
+            self.log("train/loss_pid", losses["loss_pid"], batch_size=B, sync_dist=True)
+            self.log("train/loss_charge", losses["loss_charge"], batch_size=B, sync_dist=True)
+            self.log("train/loss_assign", losses["loss_assign"], batch_size=B, sync_dist=True)
+            self.log("train/loss_stop", losses["loss_stop"], batch_size=B, sync_dist=True)
+
+            if batch_idx % self.plot_every_n_steps == 0 and self.logger is not None:
+                self._log_visualizations(output, pfo_true_objects, hit_batch[0], prefix="train")
+
+            return losses["loss"]
+
+        opt = self.optimizers()
+        opt.zero_grad()
+
+        total_steps = self.model._compute_num_steps(True, pfo_true_objects)
+        chunk_size = self.ar_chunk_size
+        n_chunks = max(1, (total_steps + chunk_size - 1) // chunk_size)
+
+        chunked_losses_sum = {
+            "loss": torch.tensor(0.0, device=self.device),
+            "loss_dir": torch.tensor(0.0, device=self.device),
+            "loss_mag": torch.tensor(0.0, device=self.device),
+            "loss_pid": torch.tensor(0.0, device=self.device),
+            "loss_charge": torch.tensor(0.0, device=self.device),
+            "loss_assign": torch.tensor(0.0, device=self.device),
+            "loss_stop": torch.tensor(0.0, device=self.device),
+        }
+
+        ar_state = None
+        B = int(hit_batch[0].max().item()) + 1 if hit_batch[0].numel() > 0 else 0
+
+        for chunk_idx, step_start in enumerate(range(0, total_steps, chunk_size)):
+            step_end = min(step_start + chunk_size, total_steps)
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+            output = self.model(
+                mv_v_part=mv_v_part,
+                mv_s_part=mv_s_part,
+                scalars=scalars,
+                pfo_true_objects=pfo_true_objects,
+                batch=hit_batch,
+                teacher_forcing=True,
+                step_start=step_start,
+                step_end=step_end,
+                ar_state=ar_state,
+                return_ar_state=True,
+            )
+            ar_state = output.pop("ar_state", None)
+
+            if output["pfo_momentum"] is None:
+                continue
+
+            losses = self.loss_fn(output, pfo_true_objects, hit_batch[0], step_offset=step_start)
+            loss_for_backward = losses["loss"] / n_chunks
+            self.manual_backward(loss_for_backward)
+
+            for key in chunked_losses_sum:
+                chunked_losses_sum[key] = chunked_losses_sum[key] + losses[key].detach()
+
+            if torch.cuda.is_available():
+                peak_mem_mb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+                self.log("train/ar_chunk_max_memory_allocated_mb", peak_mem_mb, on_step=True, prog_bar=False, sync_dist=True)
+                print(
+                    f"[AR_CHUNK_MEM] chunk={chunk_idx} steps=[{step_start},{step_end}) "
+                    f"max_memory_allocated_mb={peak_mem_mb:.2f}"
+                )
+
+        opt.step()
+
+        avg_losses = {k: v / n_chunks for k, v in chunked_losses_sum.items()}
+        self.log("train/loss", avg_losses["loss"], prog_bar=True, batch_size=B, sync_dist=True)
+        self.log("train/loss_dir", avg_losses["loss_dir"], batch_size=B, sync_dist=True)
+        self.log("train/loss_mag", avg_losses["loss_mag"], batch_size=B, sync_dist=True)
+        self.log("train/loss_pid", avg_losses["loss_pid"], batch_size=B, sync_dist=True)
+        self.log("train/loss_charge", avg_losses["loss_charge"], batch_size=B, sync_dist=True)
+        self.log("train/loss_assign", avg_losses["loss_assign"], batch_size=B, sync_dist=True)
+        self.log("train/loss_stop", avg_losses["loss_stop"], batch_size=B, sync_dist=True)
+
+        return avg_losses["loss"]
     
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):

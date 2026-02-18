@@ -259,7 +259,11 @@ class GATrAutoRegressor(nn.Module):
                 scalars: List[torch.Tensor],
                 pfo_true_objects: dict,
                 batch: List[torch.Tensor],
-                teacher_forcing: Optional[bool] = None):
+                teacher_forcing: Optional[bool] = None,
+                step_start: int = 0,
+                step_end: Optional[int] = None,
+                ar_state: Optional[dict] = None,
+                return_ar_state: bool = False):
 
         
     #     pfo_true_objects={
@@ -279,21 +283,64 @@ class GATrAutoRegressor(nn.Module):
         batch_data_length =  batch.shape[0]
         device = enc_output[0].device
         loop_teacher_forcing = self.training if teacher_forcing is None else teacher_forcing
-        pfo_list, assignments, stop_probs, assignments_logits, stop_logits = self._run_autoregressive_loop(
+        pfo_list, assignments, stop_probs, assignments_logits, stop_logits, next_ar_state = self._run_autoregressive_loop(
                 enc_output=enc_output,
                 batch_data_length=batch_data_length,
                 device = device,
                 batch=batch,
                 teacher_forcing=loop_teacher_forcing,
-                pfo_true_objects=pfo_true_objects
+                pfo_true_objects=pfo_true_objects,
+                step_start=step_start,
+                step_end=step_end,
+                ar_state=ar_state,
             )
 
-        return self._format_output(pfo_list, assignments, stop_probs, assignments_logits, stop_logits)
+        output = self._format_output(pfo_list, assignments, stop_probs, assignments_logits, stop_logits)
+        if return_ar_state:
+            output["ar_state"] = next_ar_state
+        return output
 
     # ============================
     # AUTOREGRESSIVE LOOP
     # ============================
-    def _run_autoregressive_loop(self, enc_output, batch_data_length, device, batch, teacher_forcing: bool, pfo_true_objects):
+    def _compute_num_steps(self, teacher_forcing: bool, pfo_true_objects) -> int:
+        if teacher_forcing:
+            pfo_batch = pfo_true_objects["batch"]
+            max_pfos = max(torch.bincount(pfo_batch).tolist()) if pfo_batch.numel() > 0 else 1
+            num_steps = min(max_pfos, self._max_steps())
+            if self.max_ar_steps_train is not None:
+                num_steps = min(num_steps, self.max_ar_steps_train)
+            return int(num_steps)
+        return int(self._max_steps())
+
+    def _build_next_ar_state(self, residual, pfo_list, active_events):
+        if residual is None:
+            return None
+        detached_pfo_list = []
+        if pfo_list is not None:
+            for pfo in pfo_list:
+                detached_pfo_list.append({
+                    key: value.detach() if torch.is_tensor(value) else value
+                    for key, value in pfo.items()
+                })
+        return {
+            "residual": residual.detach(),
+            "pfo_list": detached_pfo_list,
+            "active_events": active_events.detach() if active_events is not None else None,
+        }
+
+    def _run_autoregressive_loop(
+        self,
+        enc_output,
+        batch_data_length,
+        device,
+        batch,
+        teacher_forcing: bool,
+        pfo_true_objects,
+        step_start: int = 0,
+        step_end: Optional[int] = None,
+        ar_state: Optional[dict] = None,
+    ):
         """
         Main autoregressive loop.
         Generates PFOs sequentially until STOP.
@@ -301,26 +348,28 @@ class GATrAutoRegressor(nn.Module):
         Training: número de pasos = max PFOs en GT
         Inference: parar cuando todos los eventos hayan terminado
         """
-        residual = self._init_residual(batch_data_length, device)
-        pfo_list = self._init_object_sequence()
+        if ar_state is None:
+            residual = self._init_residual(batch_data_length, device)
+            pfo_list = self._init_object_sequence()
+        else:
+            residual = ar_state["residual"]
+            pfo_list = ar_state["pfo_list"]
+        pfo_list_partial = []
         assignments = []
         stop_probs = []
         assignments_logits_vec = []
         stop_logits_vec = []
         # Número de eventos del batch
         B = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
-        active_events = torch.ones(B, dtype=torch.bool, device=device)
-        
-        # En training, número de pasos = max PFOs por evento en GT
-        if teacher_forcing:
-            pfo_batch = pfo_true_objects["batch"]
-            max_pfos = max(torch.bincount(pfo_batch).tolist()) if pfo_batch.numel() > 0 else 1
-            num_steps = min(max_pfos, self._max_steps())
-            if self.max_ar_steps_train is not None:
-                num_steps = min(num_steps, self.max_ar_steps_train)
+        if ar_state is None or ar_state.get("active_events") is None:
+            active_events = torch.ones(B, dtype=torch.bool, device=device)
         else:
-            max_pfos = -1
-            num_steps = self._max_steps()
+            active_events = ar_state["active_events"]
+
+        num_steps = self._compute_num_steps(teacher_forcing, pfo_true_objects)
+        start_idx = max(0, int(step_start))
+        end_idx = num_steps if step_end is None else min(int(step_end), num_steps)
+        max_pfos = num_steps if teacher_forcing else -1
 
         if self.debug_memory:
             rank = int(torch.distributed.get_rank()) if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
@@ -329,7 +378,7 @@ class GATrAutoRegressor(nn.Module):
                 f"max_pfos={max_pfos} num_steps={num_steps} max_steps_cap={self._max_steps()}"
             )
         
-        for step_idx in range(num_steps):
+        for step_idx in range(start_idx, end_idx):
             # Build tokens
             mv_out, scalar_out = self._build_hit_tokens(enc_output, residual)
             scalar_dim = scalar_out.size(1) # (N, scalar_out + residual + one_hot_type + one_hot_pid + charge + p_mod)
@@ -402,11 +451,18 @@ class GATrAutoRegressor(nn.Module):
             assignments_logits_vec.append(assignment_logits)
             stop_logits_vec.append(stop_logits)
             self._append_pfo(pfo_list, pfo)
+            self._append_pfo(pfo_list_partial, pfo)
             assignments.append(assignment)
             stop_probs.append(stop_prob)
             if not teacher_forcing and not active_events.any():
                 break
-        return pfo_list, assignments, stop_probs, assignments_logits_vec, stop_logits_vec
+        next_state = {
+            "residual": residual,
+            "pfo_list": pfo_list,
+            "active_events": active_events,
+        }
+        next_state = self._build_next_ar_state(**next_state)
+        return pfo_list_partial, assignments, stop_probs, assignments_logits_vec, stop_logits_vec, next_state
 
     # ============================
     # INITIALIZATION
