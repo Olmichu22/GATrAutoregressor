@@ -215,7 +215,13 @@ class GATrAutoRegressor(nn.Module):
         )
         final_s_channels = autorregresive_module_cfg.out_s_channels if autorregresive_module_cfg.out_s_channels is not None else autorregresive_module_cfg.hidden_s
         self.autoregressive_module = AR_module
-        
+
+        self.max_steps = int(params_cfg.get("max_steps", 128))
+        max_ar_steps_train = params_cfg.get("max_ar_steps_train", None)
+        self.max_ar_steps_train = int(max_ar_steps_train) if max_ar_steps_train is not None else None
+        self.debug_memory = bool(params_cfg.get("debug_memory", False))
+        self.debug_memory_interval = int(params_cfg.get("debug_memory_interval", 5))
+
         self.p_head = nn.Sequential(
             nn.Linear(final_s_channels + 1, final_s_channels),
             nn.ReLU(),
@@ -310,8 +316,18 @@ class GATrAutoRegressor(nn.Module):
             pfo_batch = pfo_true_objects["batch"]
             max_pfos = max(torch.bincount(pfo_batch).tolist()) if pfo_batch.numel() > 0 else 1
             num_steps = min(max_pfos, self._max_steps())
+            if self.max_ar_steps_train is not None:
+                num_steps = min(num_steps, self.max_ar_steps_train)
         else:
+            max_pfos = -1
             num_steps = self._max_steps()
+
+        if self.debug_memory:
+            rank = int(torch.distributed.get_rank()) if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
+            print(
+                f"[AR_DEBUG][rank={rank}] teacher_forcing={teacher_forcing} "
+                f"max_pfos={max_pfos} num_steps={num_steps} max_steps_cap={self._max_steps()}"
+            )
         
         for step_idx in range(num_steps):
             # Build tokens
@@ -325,10 +341,42 @@ class GATrAutoRegressor(nn.Module):
                 (mv_out, scalar_out), object_tokens, query_token, batch, active_events
             )
 
+            if self.debug_memory and (step_idx % max(self.debug_memory_interval, 1) == 0 or step_idx == num_steps - 1):
+                n_hits = int(batch.shape[0])
+                n_obj = int(object_tokens[0].shape[0])
+                n_query = int(torch.count_nonzero(active_events).item()) if not teacher_forcing else B
+                self._log_memory_debug(
+                    step_idx=step_idx,
+                    num_steps=num_steps,
+                    n_hits=n_hits,
+                    n_obj=n_obj,
+                    n_query=n_query,
+                    tokens_mv=tokens_mv,
+                    tokens_s=tokens_s,
+                    tokens_batch=tokens_batch,
+                )
+
             # GATr decoder step
-            decoded_tokens = self._autoregressive_step( # point, scalar, scalar_out, tokens_batch
-                tokens_mv, tokens_s, tokens_batch
-            )
+            try:
+                decoded_tokens = self._autoregressive_step( # point, scalar, scalar_out, tokens_batch
+                    tokens_mv, tokens_s, tokens_batch
+                )
+            except torch.cuda.OutOfMemoryError:
+                n_hits = int(batch.shape[0])
+                n_obj = int(object_tokens[0].shape[0])
+                n_query = int(torch.count_nonzero(active_events).item()) if not teacher_forcing else B
+                self._log_memory_debug(
+                    step_idx=step_idx,
+                    num_steps=num_steps,
+                    n_hits=n_hits,
+                    n_obj=n_obj,
+                    n_query=n_query,
+                    tokens_mv=tokens_mv,
+                    tokens_s=tokens_s,
+                    tokens_batch=tokens_batch,
+                    oom=True,
+                )
+                raise
 
             query_embedding, tokens_batch = self._extract_query_embedding(decoded_tokens)
             hits_embedding = self._extract_hit_embeddings(decoded_tokens, batch, tokens_s) # HAY QUE IMPLEMENTARLO
@@ -396,7 +444,28 @@ class GATrAutoRegressor(nn.Module):
         Maximum number of autoregressive steps.
         Acts as a safety cap.
         """
-        return 128
+        return self.max_steps
+
+    def _log_memory_debug(self, step_idx, num_steps, n_hits, n_obj, n_query, tokens_mv, tokens_s, tokens_batch, oom: bool = False):
+        rank = int(torch.distributed.get_rank()) if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
+        device = tokens_mv.device
+        msg = (
+            f"[AR_DEBUG][rank={rank}] step={step_idx + 1}/{num_steps} "
+            f"N_hit={n_hits} N_obj={n_obj} N_query={n_query} N_total={int(tokens_mv.shape[0])} "
+            f"tokens_mv={tuple(tokens_mv.shape)} tokens_s={tuple(tokens_s.shape)} tokens_batch={tuple(tokens_batch.shape)}"
+        )
+        if device.type == "cuda":
+            allocated = torch.cuda.memory_allocated(device) / (1024 ** 2)
+            reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
+            max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            max_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            msg += (
+                f" allocated_mb={allocated:.1f} reserved_mb={reserved:.1f} "
+                f"max_allocated_mb={max_allocated:.1f} max_reserved_mb={max_reserved:.1f}"
+            )
+        print(msg)
+        if oom and device.type == "cuda":
+            print(torch.cuda.memory_summary(device=device, abbreviated=True))
 
     # ============================
     # TOKEN BUILDERS

@@ -417,6 +417,18 @@ class GATrAutoRegressorLightningModule(L.LightningModule):
         mv_v_part, mv_s_part, scalars, hit_batch, pfo_true_objects = self._prepare_batch(batch)
         
         # Forward pass
+        if getattr(self.cfg, "debug_memory", False):
+            rank = int(self.global_rank) if hasattr(self, "global_rank") else 0
+            n_hits = int(hit_batch[0].shape[0])
+            n_pfo = int(pfo_true_objects["batch"].shape[0])
+            b_events = int(hit_batch[0].max().item()) + 1 if hit_batch[0].numel() > 0 else 0
+            max_hits_event = int(torch.bincount(hit_batch[0].long(), minlength=b_events).max().item()) if b_events > 0 else 0
+            sum_pfo = int(torch.bincount(pfo_true_objects["batch"].long(), minlength=b_events).sum().item()) if b_events > 0 else n_pfo
+            print(
+                f"[BATCH_DEBUG][rank={rank}] batch_idx={batch_idx} B={b_events} "
+                f"sum_n_hits={n_hits} max_n_hits_event={max_hits_event} sum_n_pfo={sum_pfo}"
+            )
+
         output = self.model(
             mv_v_part=mv_v_part,
             mv_s_part=mv_s_part,
