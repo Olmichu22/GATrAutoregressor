@@ -343,7 +343,7 @@ class GATrAutoRegressor(nn.Module):
 
             if self.debug_memory and (step_idx % max(self.debug_memory_interval, 1) == 0 or step_idx == num_steps - 1):
                 n_hits = int(batch.shape[0])
-                n_obj = int(object_tokens[0].shape[0])
+                n_obj = int(object_tokens[0][0].shape[0])
                 n_query = int(torch.count_nonzero(active_events).item()) if not teacher_forcing else B
                 self._log_memory_debug(
                     step_idx=step_idx,
@@ -363,7 +363,7 @@ class GATrAutoRegressor(nn.Module):
                 )
             except torch.cuda.OutOfMemoryError:
                 n_hits = int(batch.shape[0])
-                n_obj = int(object_tokens[0].shape[0])
+                n_obj = int(object_tokens[0][0].shape[0])
                 n_query = int(torch.count_nonzero(active_events).item()) if not teacher_forcing else B
                 self._log_memory_debug(
                     step_idx=step_idx,
