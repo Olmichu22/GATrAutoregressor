@@ -273,7 +273,7 @@ class GATrAutoRegressor(nn.Module):
         batch_data_length =  batch.shape[0]
         device = enc_output[0].device
         loop_teacher_forcing = self.training if teacher_forcing is None else teacher_forcing
-        pfo_list, assignments, stop_probs = self._run_autoregressive_loop(
+        pfo_list, assignments, stop_probs, assignments_logits, stop_logits = self._run_autoregressive_loop(
                 enc_output=enc_output,
                 batch_data_length=batch_data_length,
                 device = device,
@@ -282,7 +282,7 @@ class GATrAutoRegressor(nn.Module):
                 pfo_true_objects=pfo_true_objects
             )
 
-        return self._format_output(pfo_list, assignments, stop_probs)
+        return self._format_output(pfo_list, assignments, stop_probs, assignments_logits, stop_logits)
 
     # ============================
     # AUTOREGRESSIVE LOOP
@@ -299,6 +299,8 @@ class GATrAutoRegressor(nn.Module):
         pfo_list = self._init_object_sequence()
         assignments = []
         stop_probs = []
+        assignments_logits_vec = []
+        stop_logits_vec = []
         # Número de eventos del batch
         B = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
         active_events = torch.ones(B, dtype=torch.bool, device=device)
@@ -332,11 +334,11 @@ class GATrAutoRegressor(nn.Module):
             hits_embedding = self._extract_hit_embeddings(decoded_tokens, batch, tokens_s) # HAY QUE IMPLEMENTARLO
             # Predictions
             pfo = self._predict_pfo_properties(query_embedding, tokens_batch, active_events, teacher_forcing)
-            assignment = self._predict_assignment(
+            assignment, assignment_logits = self._predict_assignment(
                 query_embedding, hits_embedding, batch, residual, active_events, teacher_forcing
             )
-            stop_prob = self._predict_stop(query_embedding, residual, batch)
-
+            stop_prob, stop_logits = self._predict_stop(query_embedding, residual, batch)
+            
             # actualizar eventos activos (solo relevante en inferencia)
             if not teacher_forcing:
                 stop_mask = stop_prob.squeeze(-1) > 0.5
@@ -349,12 +351,14 @@ class GATrAutoRegressor(nn.Module):
                 step_idx,
                 pfo_true_objects["hit_to_pfo"] if teacher_forcing else None
             )
+            assignments_logits_vec.append(assignment_logits)
+            stop_logits_vec.append(stop_logits)
             self._append_pfo(pfo_list, pfo)
             assignments.append(assignment)
             stop_probs.append(stop_prob)
             if not teacher_forcing and not active_events.any():
                 break
-        return pfo_list, assignments, stop_probs
+        return pfo_list, assignments, stop_probs, assignments_logits_vec, stop_logits_vec
 
     # ============================
     # INITIALIZATION
@@ -759,7 +763,7 @@ class GATrAutoRegressor(nn.Module):
         if not training:
             hit_active = active_events[batch]  # (N,)
             assignment = assignment * hit_active.unsqueeze(-1)
-        return assignment
+        return assignment, logits
 
 
     def _predict_stop(self, query_embedding, residual, batch):
@@ -785,7 +789,7 @@ class GATrAutoRegressor(nn.Module):
         stop_logits = self.stop_head(stop_feat)  # (B,1)
         stop_prob = torch.sigmoid(stop_logits)
 
-        return stop_prob
+        return stop_prob, stop_logits
 
 
     # ============================
@@ -867,7 +871,7 @@ class GATrAutoRegressor(nn.Module):
     # ============================
     # OUTPUT
     # ============================
-    def _format_output(self, pfo_list, assignments, stop_probs):
+    def _format_output(self, pfo_list, assignments, stop_probs, assignments_logits, stop_logits):
         """
         pfo_list: list length T, cada elemento:
         {
@@ -879,6 +883,8 @@ class GATrAutoRegressor(nn.Module):
 
         assignments: list length T, cada elemento (N_hits,1)
         stop_probs: list length T, cada elemento (B,1)
+        assignments_logits: list length T, cada elemento (N_hits,1)
+        stop_logits: list length T, cada elemento (B,1)
         """
         if len(pfo_list) == 0:
             # caso extremo: no se generó nada
@@ -889,6 +895,8 @@ class GATrAutoRegressor(nn.Module):
                 "pfo_charge": None,
                 "assignments": None,
                 "stop_probs": None,
+                "assignments_logits": None,
+                "stop_logits": None,
             }
         # for p in pfo_list:
             # print(p.keys())
@@ -898,13 +906,16 @@ class GATrAutoRegressor(nn.Module):
         pfo_charge_logits = torch.stack([p["charge"] for p in pfo_list], dim=0)  # (T,B,3)
         pfo_batch = torch.stack([p["batch"] for p in pfo_list], dim=0)                # (T,B)
         assignments_t = None
+        assignments_logits_t = None
         if len(assignments) > 0:
             assignments_t = torch.stack(assignments, dim=0)  # (T,N,1)
+            assignments_logits_t = torch.stack(assignments_logits, dim=0)  # (T,N,1)
         
         stop_probs_t = None
+        stop_logits_t = None
         if len(stop_probs) > 0:
             stop_probs_t = torch.stack(stop_probs, dim=0)  # (T,B,1)
-
+            stop_logits_t = torch.stack(stop_logits, dim=0)  # (T,B,1)
         return {
             "pfo_momentum": pfo_momentum,
             "pfo_p_mod": pfo_p_mod,
@@ -913,4 +924,6 @@ class GATrAutoRegressor(nn.Module):
             "pfo_batch": pfo_batch,
             "assignments": assignments_t,
             "stop_probs": stop_probs_t,
+            "assignments_logits": assignments_logits_t,
+            "stop_logits": stop_logits_t,
         }

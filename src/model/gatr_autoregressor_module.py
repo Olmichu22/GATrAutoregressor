@@ -208,7 +208,7 @@ class GATrAutoRegressorLoss(nn.Module):
             valid_for_step = t < pfos_per_event[hit_events]
             gt_assignment[t, :, 0] = ((hit_to_pfo == t) & valid_for_step).float()
         
-        pred_assignment = output["assignments"]  # (T, N, 1)
+        pred_assignment = output["assignments_logits"]  # (T, N, 1)
         
         # Crear máscara de validez para assignments
         # Un hit es válido en step t si su evento tiene al menos t+1 PFOs
@@ -219,7 +219,7 @@ class GATrAutoRegressorLoss(nn.Module):
         if assignment_valid_mask.any():
             pred_assign_valid = pred_assignment.squeeze(-1)[assignment_valid_mask]
             gt_assign_valid = gt_assignment.squeeze(-1)[assignment_valid_mask]
-            loss_assign = F.binary_cross_entropy(pred_assign_valid, gt_assign_valid)
+            loss_assign = F.binary_cross_entropy_with_logits(pred_assign_valid, gt_assign_valid)
         else:
             loss_assign = torch.tensor(0.0, device=device)
         
@@ -229,8 +229,8 @@ class GATrAutoRegressorLoss(nn.Module):
         step_idx_stop = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
         gt_stop = (step_idx_stop >= pfos_per_event.unsqueeze(0)).float().unsqueeze(-1)  # (T, B, 1)
         
-        pred_stop = output["stop_probs"]  # (T, B, 1)
-        loss_stop = F.binary_cross_entropy(pred_stop, gt_stop)
+        pred_stop = output["stop_logits"]  # (T, B, 1)
+        loss_stop = F.binary_cross_entropy_with_logits(pred_stop, gt_stop)
         
         # =============================================
         # 9. Loss total

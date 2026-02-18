@@ -119,7 +119,7 @@ trainer:
   max_epochs: 100
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  precision: "32"  # "32", "16-mixed", "bf16-mixed"
+  precision: "bf16-mixed"  # "32", "16-mixed", "bf16-mixed"
   accumulate_grad_batches: 1
   
   # ---- Pesos de loss ----
