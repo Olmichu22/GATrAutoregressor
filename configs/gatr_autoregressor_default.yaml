@@ -98,6 +98,8 @@ model:
   ar_out_mv_channels: 1
   ar_out_s_channels: null
   ar_dropout: 0.1
+  max_steps: 128
+  max_ar_steps_train: null  # e.g. 16/32 para depurar OOM en training
 
 # -------------------------
 # Configuración de entrenamiento
@@ -139,6 +141,9 @@ trainer:
   log_every_n_steps: 10
   plot_every_n_steps: 50
   num_sanity_val_steps: 2
+  debug_memory: false
+  debug_memory_interval: 5
+  max_ar_steps_train: null  # límite opcional de pasos AR en training
 
 # -------------------------
 # Configuración de Weights & Biases

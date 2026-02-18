@@ -96,7 +96,7 @@ def ns(d: Dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(**d)
 
 
-def build_model(model_cfg: Dict[str, Any]) -> GATrAutoRegressor:
+def build_model(model_cfg: Dict[str, Any], trainer_cfg: Optional[Dict[str, Any]] = None) -> GATrAutoRegressor:
     mode = model_cfg.get("mode", "whole_detector")
 
     whole_cfg = GATrAutoRegressorParamsWhole(
@@ -144,7 +144,22 @@ def build_model(model_cfg: Dict[str, Any]) -> GATrAutoRegressor:
         dropout=model_cfg.get("ar_dropout", 0.1),
     )
 
-    params_cfg: Dict[str, Any] = {"autoregressive_module": ar_cfg}
+    params_cfg: Dict[str, Any] = {
+        "autoregressive_module": ar_cfg,
+        "max_steps": model_cfg.get("max_steps", 128),
+        "max_ar_steps_train": model_cfg.get(
+            "max_ar_steps_train",
+            (trainer_cfg or {}).get("max_ar_steps_train", None),
+        ),
+        "debug_memory": model_cfg.get(
+            "debug_memory",
+            (trainer_cfg or {}).get("debug_memory", False),
+        ),
+        "debug_memory_interval": model_cfg.get(
+            "debug_memory_interval",
+            (trainer_cfg or {}).get("debug_memory_interval", 5),
+        ),
+    }
     if mode == "whole_detector":
         params_cfg["whole_detector"] = whole_cfg
     elif mode == "detector_split":
@@ -328,7 +343,7 @@ def main() -> None:
 
     L.seed_everything(cfg.get("seed", 42), workers=True)
 
-    model = build_model(cfg["model"])
+    model = build_model(cfg["model"], cfg.get("trainer", {}))
     trainer_cfg = ns(cfg["trainer"])
     module = GATrAutoRegressorLightningModule(
         model=model,
