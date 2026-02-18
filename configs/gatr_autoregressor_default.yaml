@@ -144,6 +144,8 @@ trainer:
   debug_memory: true
   debug_memory_interval: 5
   max_ar_steps_train: null  # límite opcional de pasos AR en training
+  ar_chunked_training: true
+  ar_chunk_size: 4
 
 # -------------------------
 # Configuración de Weights & Biases
