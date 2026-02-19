@@ -68,6 +68,25 @@ def reorganize_gt_to_tb(
     
     return output_tb, pfo_step_idx
 
+def focal_loss_with_logits(logits, targets, alpha=0.25, gamma=2.0, reduction="mean"):
+    """
+    logits: raw model outputs (sin sigmoid)
+    targets: {0,1}
+    """
+    bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    probs = torch.sigmoid(logits)
+
+    pt = torch.where(targets == 1, probs, 1 - probs)
+    focal_weight = alpha * (1 - pt) ** gamma
+
+    loss = focal_weight * bce_loss
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        return loss
 
 class GATrAutoRegressorLoss(nn.Module):
     """
@@ -222,7 +241,9 @@ class GATrAutoRegressorLoss(nn.Module):
         if assignment_valid_mask.any():
             pred_assign_valid = pred_assignment.squeeze(-1)[assignment_valid_mask]
             gt_assign_valid = gt_assignment.squeeze(-1)[assignment_valid_mask]
-            loss_assign = F.binary_cross_entropy_with_logits(pred_assign_valid, gt_assign_valid)
+            loss_assign = focal_loss_with_logits(pred_assign_valid, gt_assign_valid,
+                                                 alpha=0.25,
+                                                 gamma=2.0)
         else:
             loss_assign = torch.tensor(0.0, device=device)
         
