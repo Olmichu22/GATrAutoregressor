@@ -65,6 +65,8 @@ def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
         cfg["trainer"]["lr"] = args.lr
     if args.weight_decay is not None:
         cfg["trainer"]["weight_decay"] = args.weight_decay
+    if args.warmup_pct is not None:
+        cfg["trainer"]["warmup_pct"] = args.warmup_pct
     if args.precision is not None:
         cfg["trainer"]["precision"] = args.precision
     if args.accumulate_grad_batches is not None:
@@ -313,6 +315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight-decay", type=float)
+    parser.add_argument("--warmup-pct", type=float, help="Fracción de épocas para warm-up LR (ej: 0.1)")
     parser.add_argument("--precision")
     parser.add_argument("--accumulate-grad-batches", type=int)
     parser.add_argument("--gradient-clip-val", type=float)

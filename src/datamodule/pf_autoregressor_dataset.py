@@ -29,6 +29,8 @@ from typing import List, Optional, Dict, Tuple, Union
 from pathlib import Path
 from dataclasses import dataclass, field
 import logging
+import argparse
+import csv
 
 
 # =============================================
@@ -921,7 +923,7 @@ def test_data_structure(npz_path: str):
     # Verificar shapes
     assert data.pos.shape == (data.n_hits, 3)
     assert data.mv_v_part.shape == (data.n_hits, 3)
-    assert data.mv_s_part.shape == (data.n_hits, 3)
+    assert data.mv_s_part.shape == (data.n_hits, 1)
     assert data.scalars.shape == (data.n_hits, 6)
     assert data.pfo_pid.shape == (data.n_pfo, 5)
     assert data.pfo_momentum.shape == (data.n_pfo, 3)
@@ -1080,25 +1082,372 @@ def test_preprocessor(npz_path: str):
     print("\n✓ Preprocessor test passed!")
 
 
+def _parse_event_selection(event_spec: str, max_events: int) -> List[int]:
+    """
+    Parsea especificación de eventos tipo "0,3,5-8".
+    
+    Args:
+        event_spec: Cadena con índices/rangos separados por coma.
+        max_events: Número total de eventos del dataset.
+    
+    Returns:
+        Lista ordenada de índices de eventos válidos (sin duplicados).
+    """
+    if not event_spec or not event_spec.strip():
+        raise ValueError("La selección de eventos está vacía.")
+    
+    selected = set()
+    chunks = [c.strip() for c in event_spec.split(",") if c.strip()]
+    
+    for chunk in chunks:
+        if "-" in chunk:
+            bounds = [b.strip() for b in chunk.split("-", maxsplit=1)]
+            if len(bounds) != 2:
+                raise ValueError(f"Rango inválido: '{chunk}'")
+            start, end = int(bounds[0]), int(bounds[1])
+            if start > end:
+                raise ValueError(f"Rango inválido (start > end): '{chunk}'")
+            for evt_idx in range(start, end + 1):
+                if evt_idx < 0 or evt_idx >= max_events:
+                    raise ValueError(
+                        f"Evento fuera de rango: {evt_idx}. Dataset tiene [0, {max_events - 1}]"
+                    )
+                selected.add(evt_idx)
+        else:
+            evt_idx = int(chunk)
+            if evt_idx < 0 or evt_idx >= max_events:
+                raise ValueError(
+                    f"Evento fuera de rango: {evt_idx}. Dataset tiene [0, {max_events - 1}]"
+                )
+            selected.add(evt_idx)
+    
+    return sorted(selected)
+
+
+def _load_raw_event(dataset: PFAutoRegressorDataset, global_event_idx: int) -> Dict:
+    """Carga datos raw de un evento usando la misma indexación global del dataset."""
+    file_idx, event_idx = dataset.global_index[global_event_idx]
+    if dataset.mode == "memory":
+        return dataset._load_event_memory(file_idx, event_idx)
+    return dataset._load_event_lazy(file_idx, event_idx)
+
+
+def _collect_event_diagnostics(dataset: PFAutoRegressorDataset, event_idx: int) -> Dict:
+    """
+    Extrae información detallada del evento:
+    - propiedades de PFOs
+    - asociaciones hit→PFO y pesos
+    - Data procesado para validar consistencia
+    """
+    event_raw = _load_raw_event(dataset, event_idx)
+    data = dataset.get(event_idx)
+    
+    hits = event_raw["hits"]
+    particles_all = event_raw["particles"]
+    hit_to_particle = event_raw["hit_to_particle"]
+    hit_weights = event_raw["hit_weights"]
+    n_hits = len(hits)
+    
+    unique_particle_indices = set()
+    for i in range(n_hits):
+        for j in range(dataset.max_particles_per_hit):
+            part_idx = int(hit_to_particle[i, j])
+            if part_idx >= 0 and particles_all[part_idx]["gen_status"] in VALID_GEN_STATUS:
+                unique_particle_indices.add(part_idx)
+    
+    pf_order = {1: 0, 0: 1, 2: 2, 4: 3, 3: 4}
+    
+    def pfo_sort_key(part_idx: int):
+        pid = int(particles_all[part_idx]["pid"])
+        pid_class = PID_TO_CLASS.get(abs(pid), DEFAULT_CLASS)
+        pf_priority = pf_order.get(pid_class, 5)
+        energy = float(particles_all[part_idx]["energy"])
+        return (pf_priority, -energy)
+    
+    unique_particle_indices = sorted(list(unique_particle_indices), key=pfo_sort_key)
+    particle_to_pfo = {part_idx: pfo_idx for pfo_idx, part_idx in enumerate(unique_particle_indices)}
+    
+    hit_best_pfo = np.full(n_hits, -1, dtype=np.int64)
+    hit_best_particle = np.full(n_hits, -1, dtype=np.int64)
+    hit_best_weight = np.zeros(n_hits, dtype=np.float32)
+    
+    for i in range(n_hits):
+        best_weight = -1.0
+        best_pfo = -1
+        best_particle = -1
+        for j in range(dataset.max_particles_per_hit):
+            part_idx = int(hit_to_particle[i, j])
+            weight = float(hit_weights[i, j])
+            if part_idx < 0:
+                continue
+            if particles_all[part_idx]["gen_status"] not in VALID_GEN_STATUS:
+                continue
+            if part_idx not in particle_to_pfo:
+                continue
+            if weight > best_weight:
+                best_weight = weight
+                best_particle = part_idx
+                best_pfo = particle_to_pfo[part_idx]
+        hit_best_pfo[i] = best_pfo
+        hit_best_particle[i] = best_particle
+        hit_best_weight[i] = max(best_weight, 0.0)
+    
+    pfo_rows = []
+    for pfo_idx, part_idx in enumerate(unique_particle_indices):
+        part = particles_all[part_idx]
+        pid = int(part["pid"])
+        px = float(part["px"])
+        py = float(part["py"])
+        pz = float(part["pz"])
+        p_mod = float(np.sqrt(px**2 + py**2 + pz**2))
+        log_p_mod = float(np.log(p_mod + dataset.preprocessor.config.log_eps))
+        mask = hit_best_pfo == pfo_idx
+        pfo_rows.append({
+            "event_idx": event_idx,
+            "pfo_idx": pfo_idx,
+            "particle_idx": int(part_idx),
+            "pid": pid,
+            "pid_class": int(PID_TO_CLASS.get(abs(pid), DEFAULT_CLASS)),
+            "charge": float(part["charge"]),
+            "gen_status": int(part["gen_status"]),
+            "px": px,
+            "py": py,
+            "pz": pz,
+            "p_mod": p_mod,
+            "log_p_mod": log_p_mod,
+            "n_associated_hits": int(np.sum(mask)),
+            "sum_assoc_weight": float(np.sum(hit_best_weight[mask])) if np.any(mask) else 0.0,
+            "max_assoc_weight": float(np.max(hit_best_weight[mask])) if np.any(mask) else 0.0,
+        })
+    
+    assoc_rows = []
+    for i in range(n_hits):
+        assoc_rows.append({
+            "event_idx": event_idx,
+            "hit_idx": i,
+            "x": float(hits["x"][i]),
+            "y": float(hits["y"][i]),
+            "z": float(hits["z"][i]),
+            "energy": float(hits["energy"][i]),
+            "p": float(hits["p"][i]),
+            "detector_type": int(hits["detector_type"][i]),
+            "pfo_idx": int(hit_best_pfo[i]),
+            "particle_idx": int(hit_best_particle[i]),
+            "assoc_weight": float(hit_best_weight[i]),
+        })
+    
+    return {
+        "data": data,
+        "hits": hits,
+        "pfo_rows": pfo_rows,
+        "assoc_rows": assoc_rows,
+        "hit_best_pfo": hit_best_pfo,
+        "hit_best_weight": hit_best_weight,
+    }
+
+
+def _write_csv_rows(path: Path, rows: List[Dict], fieldnames: List[str]) -> None:
+    """Escribe filas en CSV con encabezado."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _plot_pfo_projections(
+    out_path: Path,
+    event_idx: int,
+    pfo_row: Dict,
+    hits: np.ndarray,
+    hit_best_pfo: np.ndarray,
+    hit_best_weight: np.ndarray,
+) -> None:
+    """Genera un plot con dos subplots (XY e YZ) para un PFO."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(
+            "matplotlib no está disponible. Instálalo para generar plots."
+        ) from exc
+    
+    pfo_idx = int(pfo_row["pfo_idx"])
+    assoc_mask = hit_best_pfo == pfo_idx
+    
+    x = hits["x"].astype(np.float32)
+    y = hits["y"].astype(np.float32)
+    z = hits["z"].astype(np.float32)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=120)
+    
+    # XY
+    axes[0].scatter(x, y, s=8, c="lightgray", alpha=0.35, label="All hits")
+    if np.any(assoc_mask):
+        sc_xy = axes[0].scatter(
+            x[assoc_mask], y[assoc_mask],
+            s=24, c=hit_best_weight[assoc_mask], cmap="viridis", vmin=0.0, vmax=1.0,
+            label="Associated hits"
+        )
+        fig.colorbar(sc_xy, ax=axes[0], fraction=0.046, pad=0.04, label="Assoc weight")
+    axes[0].set_title(f"Event {event_idx} | PFO {pfo_idx} | XY")
+    axes[0].set_xlabel("x")
+    axes[0].set_ylabel("y")
+    axes[0].grid(alpha=0.2)
+    axes[0].legend(loc="best")
+    
+    # YZ
+    axes[1].scatter(y, z, s=8, c="lightgray", alpha=0.35, label="All hits")
+    if np.any(assoc_mask):
+        sc_yz = axes[1].scatter(
+            y[assoc_mask], z[assoc_mask],
+            s=24, c=hit_best_weight[assoc_mask], cmap="viridis", vmin=0.0, vmax=1.0,
+            label="Associated hits"
+        )
+        fig.colorbar(sc_yz, ax=axes[1], fraction=0.046, pad=0.04, label="Assoc weight")
+    axes[1].set_title(f"Event {event_idx} | PFO {pfo_idx} | YZ")
+    axes[1].set_xlabel("y")
+    axes[1].set_ylabel("z")
+    axes[1].grid(alpha=0.2)
+    axes[1].legend(loc="best")
+    
+    summary = (
+        f"pid={pfo_row['pid']} class={pfo_row['pid_class']} q={pfo_row['charge']:+.1f}\n"
+        f"p=({pfo_row['px']:.2f}, {pfo_row['py']:.2f}, {pfo_row['pz']:.2f})\n"
+        f"|p|={pfo_row['p_mod']:.2f}  log|p|={pfo_row['log_p_mod']:.2f}\n"
+        f"assoc_hits={pfo_row['n_associated_hits']}  sum_w={pfo_row['sum_assoc_weight']:.2f}"
+    )
+    fig.text(
+        0.5, 0.01, summary,
+        ha="center", va="bottom", fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "gray"}
+    )
+    
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def test_event_diagnostics(
+    npz_path: str,
+    event_indices: List[int],
+    output_dir: str = "test",
+    mode: str = "memory",
+) -> None:
+    """
+    Test exhaustivo de inspección por evento.
+    
+    Para cada evento:
+    - guarda CSV de PFOs (`pfos.csv`)
+    - guarda CSV de asociaciones (`hit_associations.csv`)
+    - genera un plot XY/YZ por PFO (`pfo_XXX.png`)
+    """
+    print("\n" + "=" * 60)
+    print("TEST: Event Diagnostics (CSV + PFO plots)")
+    print("=" * 60)
+    
+    dataset = PFAutoRegressorDataset([npz_path], mode=mode)
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nOutput root: {out_root.resolve()}")
+    print(f"Selected events: {event_indices}")
+    
+    pfo_fields = [
+        "event_idx", "pfo_idx", "particle_idx", "pid", "pid_class",
+        "charge", "gen_status", "px", "py", "pz",
+        "p_mod", "log_p_mod", "n_associated_hits", "sum_assoc_weight", "max_assoc_weight",
+    ]
+    assoc_fields = [
+        "event_idx", "hit_idx", "x", "y", "z",
+        "energy", "p", "detector_type", "pfo_idx", "particle_idx", "assoc_weight",
+    ]
+    
+    for event_idx in event_indices:
+        event_dir = out_root / f"event_{event_idx:06d}"
+        event_dir.mkdir(parents=True, exist_ok=True)
+        
+        diag = _collect_event_diagnostics(dataset, event_idx)
+        pfo_rows = diag["pfo_rows"]
+        assoc_rows = diag["assoc_rows"]
+        
+        _write_csv_rows(event_dir / "pfos.csv", pfo_rows, pfo_fields)
+        _write_csv_rows(event_dir / "hit_associations.csv", assoc_rows, assoc_fields)
+        
+        for pfo_row in pfo_rows:
+            pfo_idx = int(pfo_row["pfo_idx"])
+            plot_path = event_dir / f"pfo_{pfo_idx:03d}.png"
+            _plot_pfo_projections(
+                plot_path,
+                event_idx=event_idx,
+                pfo_row=pfo_row,
+                hits=diag["hits"],
+                hit_best_pfo=diag["hit_best_pfo"],
+                hit_best_weight=diag["hit_best_weight"],
+            )
+        
+        print(
+            f"  Event {event_idx}: "
+            f"{len(pfo_rows)} PFOs, {len(assoc_rows)} hits -> {event_dir}"
+        )
+    
+    dataset.close()
+    print("\n✓ Event diagnostics test passed!")
+
+
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python pf_autoregressor_dataset.py <npz_file>")
-        print("Example: python pf_autoregressor_dataset.py data.npz")
-        sys.exit(1)
-    
-    npz_path = sys.argv[1]
+    parser = argparse.ArgumentParser(
+        description="Tests y diagnóstico de PFAutoRegressorDataset"
+    )
+    parser.add_argument("npz_file", type=str, help="Archivo .npz con eventos PF")
+    parser.add_argument(
+        "--events",
+        type=str,
+        default="0",
+        help="Eventos a procesar (ej: '0,2,5-8')",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="test",
+        help="Carpeta de salida para resultados por evento",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="memory",
+        choices=["memory", "lazy"],
+        help="Modo del dataset para diagnóstico",
+    )
+    parser.add_argument(
+        "--skip-basic-tests",
+        action="store_true",
+        help="Omite los tests básicos y ejecuta solo el diagnóstico exhaustivo",
+    )
+    args = parser.parse_args()
     
     logging.basicConfig(level=logging.INFO)
     
-    # Ejecutar todos los tests
-    test_dataset_loading(npz_path)
-    test_data_structure(npz_path)
-    test_dataloader(npz_path)
-    test_pfo_validity(npz_path)
-    test_preprocessor(npz_path)
+    dataset_for_index = PFAutoRegressorDataset([args.npz_file], mode=args.mode)
+    total_events = dataset_for_index.len()
+    selected_events = _parse_event_selection(args.events, total_events)
+    dataset_for_index.close()
+    
+    if not args.skip_basic_tests:
+        test_dataset_loading(args.npz_file)
+        test_data_structure(args.npz_file)
+        test_dataloader(args.npz_file)
+        test_pfo_validity(args.npz_file)
+        test_preprocessor(args.npz_file)
+    
+    test_event_diagnostics(
+        npz_path=args.npz_file,
+        event_indices=selected_events,
+        output_dir=args.output_dir,
+        mode=args.mode,
+    )
     
     print("\n" + "=" * 60)
-    print("ALL TESTS PASSED!")
+    print("ALL REQUESTED TESTS PASSED!")
     print("=" * 60)

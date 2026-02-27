@@ -7,7 +7,7 @@ from src.model.gatr_module import GATrBasicModule
 from torch_scatter import scatter_mean
 from dataclasses import dataclass, field
 from typing import List, Optional
-
+from torch.utils.checkpoint import checkpoint
 def concatenate_outputs(outputs, batch):
     n_outputs = len(outputs)
     n_batch = len(batch)
@@ -199,6 +199,7 @@ class GATrAutoRegressor(nn.Module):
             )
             out_s_dim = cfg.final_module_cfg.out_s_channels if cfg.final_module_cfg.out_s_channels is not None else cfg.final_module_cfg.hidden_s
             out_mv_channels = cfg.final_module_cfg.out_mv_channels
+            
         self.autoregressive_module = None  # Placeholder for autoregressive module initialization
         autorregresive_module_cfg: GATrAutoRegressive = params_cfg.get("autoregressive_module")
         if autorregresive_module_cfg is None:
@@ -223,20 +224,29 @@ class GATrAutoRegressor(nn.Module):
         self.debug_memory_interval = int(params_cfg.get("debug_memory_interval", 5))
         
         self.use_gatr_assignment_head = bool(params_cfg.get("use_gatr_assignment_head", False))
-        if use_gatr_assignment_head:
+        if self.use_gatr_assignment_head:
             num_blocks = params_cfg.get("assignment_head_num_blocks", 2)
-
-
-        self.assignment_gatr = GATrBasicModule(
-            hidden_mv_channels = autorregresive_module_cfg.hidden_mv,
-            hidden_s_channels = autorregresive_module_cfg.hidden_s,
-            num_blocks = autorregresive_module_cfg.num_blocks,
-            in_s_channels = out_s_dim + 1 + 3 + 5 + 2,  # scalars + residual(1) + one_hot_type(3) + one_hot_pid(5) + charge(1) + p_mod(1)
-            in_mv_channels = out_mv_channels,
-            out_mv_channels = autorregresive_module_cfg.out_mv_channels,
-            dropout = autorregresive_module_cfg.dropout,
-            out_s_channels = autorregresive_module_cfg.out_s_channels
-        )
+            hidden_s_assignment = params_cfg.get("assignment_head_hidden_s", 64)
+            dropout_assignment = params_cfg.get("assignment_head_dropout", 0.1)
+            
+            self.assignment_head = GATrBasicModule(
+                hidden_mv_channels = autorregresive_module_cfg.hidden_mv,
+                hidden_s_channels = hidden_s_assignment,
+                num_blocks = num_blocks,
+                in_s_channels = final_s_channels,  # scalars + residual(1) + one_hot_type(3) + one_hot_pid(5) + charge(1) + p_mod(1)
+                in_mv_channels = out_mv_channels,
+                out_mv_channels = autorregresive_module_cfg.out_mv_channels,
+                dropout = dropout_assignment,
+                out_s_channels = 1
+            )
+        else:
+            self.assignment_head = nn.Sequential(
+                nn.Linear(final_s_channels + final_s_channels + 1 + 1 + 3 + 1, final_s_channels),
+                # hit_point(3) + hit_scalar(1) + hit_scalar_out(S) + query_scalar_out(S) + query_scalar(1) + residual(1)
+                nn.ReLU(),
+                nn.Linear(final_s_channels, 1)
+            )
+            
         self.p_head = nn.Sequential(
             nn.Linear(final_s_channels + 1, final_s_channels),
             nn.ReLU(),
@@ -255,12 +265,6 @@ class GATrAutoRegressor(nn.Module):
             nn.Linear(final_s_channels, 1)   # Va a ser un valor continuo
         )
 
-        self.assignment_head = nn.Sequential(
-            nn.Linear(final_s_channels + final_s_channels + 1 + 1 + 3 + 1, final_s_channels),
-            # hit_point(3) + hit_scalar(1) + hit_scalar_out(S) + query_scalar_out(S) + query_scalar(1) + residual(1)
-            nn.ReLU(),
-            nn.Linear(final_s_channels, 1)
-        )
 
         self.stop_head = nn.Sequential(
             nn.Linear(final_s_channels + 1 + 1, final_s_channels),
@@ -373,9 +377,18 @@ class GATrAutoRegressor(nn.Module):
 
             # GATr decoder step
             try:
-                decoded_tokens = self._autoregressive_step( # point, scalar, scalar_out, tokens_batch
-                    tokens_mv, tokens_s, tokens_batch
-                )
+                if self.training:
+                    decoded_tokens = checkpoint(
+                        self._autoregressive_step_ckpt,
+                        tokens_mv,
+                        tokens_s,
+                        tokens_batch,
+                        use_reentrant=False,   # importante en PyTorch >=2.0
+                    )
+                else:
+                    decoded_tokens = self._autoregressive_step(
+                        tokens_mv, tokens_s, tokens_batch
+                    )
             except torch.cuda.OutOfMemoryError:
                 n_hits = int(batch.shape[0])
                 n_obj = int(object_tokens[0][0].shape[0])
@@ -393,13 +406,23 @@ class GATrAutoRegressor(nn.Module):
                 )
                 raise
 
+            hits_embedding = self._extract_hit_embeddings(decoded_tokens, batch, tokens_s)
             query_embedding = self._extract_query_embedding(decoded_tokens)
-            hits_embedding = self._extract_hit_embeddings(decoded_tokens, batch, tokens_s) # HAY QUE IMPLEMENTARLO
             # Predictions
-            pfo = self._predict_pfo_properties(query_embedding, active_events, teacher_forcing)
-            assignment, assignment_logits = self._predict_assignment(
-                query_embedding, hits_embedding, batch, residual, active_events, teacher_forcing
-            )
+            if self.use_gatr_assignment_head:
+                assignment, assignment_logits, decoded_tokens_assignment = self._predict_assignment(
+                decoded_tokens, query_embedding, hits_embedding, batch, residual, active_events, teacher_forcing)
+
+                query_embedding = self._extract_query_embedding(decoded_tokens_assignment)
+                pfo = self._predict_pfo_properties(query_embedding, active_events, teacher_forcing)
+                
+            else:
+                
+                pfo = self._predict_pfo_properties(query_embedding, active_events, teacher_forcing)
+                
+                assignment, assignment_logits, _ = self._predict_assignment(
+                decoded_tokens, query_embedding, hits_embedding, batch, residual, active_events, teacher_forcing)
+                
             stop_prob, stop_logits = self._predict_stop(query_embedding, residual, batch)
             
             # actualizar eventos activos (solo relevante en inferencia)
@@ -422,7 +445,11 @@ class GATrAutoRegressor(nn.Module):
             if not teacher_forcing and not active_events.any():
                 break
         return pfo_list, assignments, stop_probs, assignments_logits_vec, stop_logits_vec
-
+    
+    
+    def _autoregressive_step_ckpt(self, tokens_mv, tokens_s, tokens_batch):
+        # Este método es para facilitar la depuración y el checkpointing del paso autoregresivo
+        return self._autoregressive_step(tokens_mv, tokens_s, tokens_batch)
     # ============================
     # INITIALIZATION
     # ============================
@@ -447,6 +474,7 @@ class GATrAutoRegressor(nn.Module):
             "hit_point": hit_point,
             "hit_scalar": hit_scalar,
             "hit_scalar_out": hit_scalar_out,
+            "is_hit": is_hit
         }
     
     def _init_residual(self, batch_data_length, device):
@@ -782,14 +810,18 @@ class GATrAutoRegressor(nn.Module):
             query_idx = evt_indices[-1]  # Último token es QUERY
             query_indices.append(query_idx.item())
         query_indices = torch.tensor(query_indices, device=point.device)
+        query_mv = mv_out[query_indices]       # (B, 16)
         query_point = point[query_indices]    # (B, 3)
         query_scalar = scalar[query_indices]  # (B, S)
         query_scalar_out = scalar_out[query_indices]  # (B, S_out)
+        is_query = torch.zeros_like(tokens_batch, dtype=torch.bool, device=tokens_batch.device)
+        is_query[query_indices] = True
         return {"query_mv": query_mv,
                 "query_point": query_point,
                 "query_scalar": query_scalar,
                 "query_scalar_out": query_scalar_out,
-                "tokens_batch": tokens_batch}
+                "tokens_batch": tokens_batch,
+                "is_query": is_query}
 
     # ============================
     # HEADS
@@ -804,7 +836,8 @@ class GATrAutoRegressor(nn.Module):
         direction = query_point / (query_point.norm(dim=-1, keepdim=True) + 1e-8)
         scalar_cond = torch.cat([query_scalar_out, query_scalar], dim=-1)
 
-        p_mod = torch.nn.functional.softplus(self.p_head(scalar_cond))
+        log_p_mod = self.p_head(scalar_cond)
+        p_mod = torch.exp(log_p_mod)
         momentum = direction * p_mod
         pid_logits = self.pid_head(scalar_cond)
         charge_logits = self.charge_head(scalar_cond)
@@ -818,7 +851,7 @@ class GATrAutoRegressor(nn.Module):
             return {
                 "batch": pfo_batch,
                 "momentum": momentum,
-                "p_mod": p_mod,
+                "p_mod": log_p_mod,
                 "pid": pid_logits,
                 "charge": charge_logits,
             }
@@ -827,12 +860,12 @@ class GATrAutoRegressor(nn.Module):
             return {
                 "batch": pfo_batch[active_mask],
                 "momentum": momentum[active_mask],
-                "p_mod": p_mod[active_mask],
+                "p_mod": log_p_mod[active_mask],
                 "pid": pid_logits[active_mask],
                 "charge": charge_logits[active_mask],
             }
 
-    def _predict_assignment(self, query_embedding, dec_output_hits, batch, residual, active_events, training: bool):
+    def _predict_assignment(self, decoded_tokens, query_embedding, dec_output_hits, batch, residual, active_events, training: bool):
         """
         Predict soft assignment of hits to current PFO.
         """
@@ -840,6 +873,7 @@ class GATrAutoRegressor(nn.Module):
         query_point = query_embedding["query_point"]
         query_scalar = query_embedding["query_scalar"]
         query_scalar_out = query_embedding["query_scalar_out"]
+        is_query = query_embedding["is_query"]
         # query_scalar: (B,1)
         # query_scalar_out: (B,S)
 
@@ -847,40 +881,68 @@ class GATrAutoRegressor(nn.Module):
         hit_point = dec_output_hits["hit_point"]
         hit_scalar = dec_output_hits["hit_scalar"]
         hit_scalar_out = dec_output_hits["hit_scalar_out"]
+        is_hit = dec_output_hits["is_hit"]
         # hit_scalar: (N,S)
         # residual: (N,1)
 
+        decoded_mv = decoded_tokens["mv_out"]
+        decoded_point = decoded_tokens["point"]
+        decoded_scalar = decoded_tokens["scalar"]
+        decoded_scalar_out = decoded_tokens["scalar_out"]
+        tokens_batch = decoded_tokens["tokens_batch"]
+        
         device = hit_scalar.device
         N = hit_scalar.size(0)
 
-        # Expand query embeddings to hit level
-        query_scalar_out_exp = query_scalar_out[batch]  # (N,S)
-        query_scalar_exp = query_scalar[batch]          # (N,1)
+        if not self.use_gatr_assignment_head:
+            # Expand query embeddings to hit level
+            query_scalar_out_exp = query_scalar_out[batch]  # (N,S)
+            query_scalar_exp = query_scalar[batch]          # (N,1)
 
-        # Build assignment features
-        assign_feat = torch.cat(
-            [   hit_point, # (N,3)
-                hit_scalar, # (N, 1)
-                hit_scalar_out, # (N,S)
-                query_scalar_out_exp, # (N,S)
-                query_scalar_exp, # (N,1)
-                residual # (N,1)
-            ],
-            dim=-1
-        )
+            # Build assignment features
+            assign_feat = torch.cat(
+                [   hit_point, # (N,3)
+                    hit_scalar, # (N, 1)
+                    hit_scalar_out, # (N,S)
+                    query_scalar_out_exp, # (N,S)
+                    query_scalar_exp, # (N,1)
+                    residual # (N,1)
+                ],
+                dim=-1
+            )
 
-        # Predict contribution
-        logits = self.assignment_head(assign_feat)  # (N,1)
-        assignment = torch.sigmoid(logits)
+            # Predict contribution
+            logits = self.assignment_head(assign_feat)  # (N,1)
+            assignment = torch.sigmoid(logits)
 
-        # Mask with residual (very important)
-        assignment = assignment * residual
-        
-        # anular hits de eventos ya parados (solo en inferencia)
-        if not training:
-            hit_active = active_events[batch]  # (N,)
-            assignment = assignment * hit_active.unsqueeze(-1)
-        return assignment, logits
+            # Mask with residual (very important)
+            assignment = assignment * residual
+            
+            # anular hits de eventos ya parados (solo en inferencia)
+            if not training:
+                hit_active = active_events[batch]  # (N,)
+                assignment = assignment * hit_active.unsqueeze(-1)
+            return assignment, logits , None
+        else:
+            # Use GATr assignment head
+            mv_assignment, scalar_out_assignment, point_assignment, scalar_assignment = self.assignment_head(mv_v_part=None,
+                            mv_s_part=None,
+                            scalars=decoded_scalar_out,
+                            batch=tokens_batch,
+                            embedded_geom=decoded_mv)
+            logits = scalar_assignment[is_hit]
+            assignment = torch.sigmoid(logits)
+            # Mask with residual
+            assignment = assignment * residual
+            # anular hits de eventos ya parados (solo en inferencia)
+            if not training:
+                hit_active = active_events[batch]  # (N,)
+                assignment = assignment * hit_active.unsqueeze(-1)
+            return assignment, logits, {"mv_out": mv_assignment,
+                "point": point_assignment,
+                "scalar": scalar_assignment,
+                "scalar_out": scalar_out_assignment,
+                "tokens_batch": tokens_batch}
 
 
     def _predict_stop(self, query_embedding, residual, batch):
